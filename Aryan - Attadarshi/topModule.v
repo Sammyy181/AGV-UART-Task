@@ -616,8 +616,9 @@ module lidar_system_top (
     reg [7:0] tx_data;              // The byte of data up for transmission
     reg       tx_send;              // Tells the transmitter to load tx_data on the line
     wire      tx_busy;              // Pulled high when tx is busy transmitting a frame
-    reg [31:0] tx_packet;           // Declaring a 4 byte packet from which to transmit - Max and Min angle
+    reg [47:0] tx_packet;           // 6-byte packet: max (2), min (2), obs_alert (2)
 
+    // TxD instantiation
     TxD u_txd (
         .clk(clk),
         .rst(rst),
@@ -634,8 +635,7 @@ module lidar_system_top (
     localparam TX_WAIT  = 3'd3; // wait for tx_busy to finish (go back to 0)
 
     reg [2:0] tx_state;    // stores current state
-    reg [1:0] byte_ptr;    // Which byte of the packet is being transmitted rn
-    reg [15:0] send_word;  // Current 16 bit thing being sent
+    reg [2:0] byte_ptr;    // Which byte of the packet is being transmitted rn
 
     // Delay the angle_done by one clock so angle outputs are stable (already talked about before)
     reg angle_done_d;
@@ -646,39 +646,37 @@ module lidar_system_top (
 
     // TX FSM: ensures tx_data is stable one cycle before asserting tx_send
     always @(posedge clk) begin
-        if (rst) begin                          // reset
+        if (rst) begin
             tx_state   <= TX_IDLE;
             tx_send    <= 1'b0;
             tx_data    <= 8'd0;
-            tx_packet  <= 32'd0;
-            byte_ptr   <= 2'd0;
+            tx_packet  <= 48'd0;
+            byte_ptr   <= 3'd0;
         end else begin
-            // default: clear one-cycle send strobe
-            tx_send <= 1'b0;
+            tx_send <= 1'b0;        // default clear
 
             case (tx_state)
                 TX_IDLE: begin
-                    // use edge-detected angle_done (angle_done_d is 1-cycle delayed)
                     if (angle_done_d) begin
-                        // Loading the whole 4 byte packet
-                        // store LSB then MSB order for max, then min
-                        // tx_packet[7:0]   = max_lo
-                        // tx_packet[15:8]  = max_hi
-                        // tx_packet[23:16] = min_lo
-                        // tx_packet[31:24] = min_hi
-                        tx_packet <= { min_angle[15:8], min_angle[7:0], max_angle[15:8], max_angle[7:0] };
-                        byte_ptr <= 2'd0;           // set to 0
+                        // pack 6 bytes: {min_hi,min_lo,max_hi,max_lo,obs_hi,obs_lo}
+                        tx_packet <= { min_angle[15:8], min_angle[7:0],
+                                       max_angle[15:8], max_angle[7:0],
+                                       obs_alert[15:8], obs_alert[7:0] };
+                        byte_ptr <= 3'd0;              // set to 0
                         tx_state <= TX_PREP;        // switch next state
                     end
                 end
 
                 TX_PREP: begin
                     // pick up the designated byte from the packet and load it in Tx
-                    case (byte_ptr)                 
-                        2'd0: tx_data <= tx_packet[7:0];    // max LSB
-                        2'd1: tx_data <= tx_packet[15:8];   // max MSB
-                        2'd2: tx_data <= tx_packet[23:16];  // min LSB
-                        2'd3: tx_data <= tx_packet[31:24];  // min MSB
+                    // select byte from tx_packet (LSB-first for max, then min, then obs)
+                    case (byte_ptr)
+                        3'd0: tx_data <= tx_packet[7:0];     // max_lo
+                        3'd1: tx_data <= tx_packet[15:8];    // max_hi
+                        3'd2: tx_data <= tx_packet[23:16];   // min_lo
+                        3'd3: tx_data <= tx_packet[31:24];   // min_hi
+                        3'd4: tx_data <= tx_packet[39:32];   // obs_lo
+                        3'd5: tx_data <= tx_packet[47:40];   // obs_hi
                         default: tx_data <= 8'h00;
                     endcase
                     tx_state <= TX_SEND;
@@ -691,19 +689,20 @@ module lidar_system_top (
                     end
                 end
 
-                TX_WAIT: begin                      // wait for transmitter to finish the byte (busy clears)
+                TX_WAIT: begin                  // wait for transmitter to finish the byte (busy clears)
                     if (!tx_busy) begin
-                        if (byte_ptr == 2'd3) begin // once finished all 4 bytes, reset for the next packed loading
-                            byte_ptr <= 2'd0;
+                        if (byte_ptr == 3'd5) begin         // once finished all 4 bytes, reset for the next packed loading
+                            // finished all 6 bytes
+                            byte_ptr <= 3'd0;
                             tx_state <= TX_IDLE;
-                       end else begin               // if not done with it, move on
-                            byte_ptr <= byte_ptr + 1'b1;
+                        end else begin                      // if not done with it, move on
+                            byte_ptr <= byte_ptr + 3'd1;
                             tx_state <= TX_PREP;
                         end
                     end
                 end
 
-                default: tx_state <= TX_IDLE;       // default to idle
+                default: tx_state <= TX_IDLE;
             endcase
         end
     end
